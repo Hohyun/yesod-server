@@ -27,25 +27,25 @@ getReceiptInfoR paymentid = do
 data RcptTrx = RcptTrx
     { trxid :: String
     , receipts :: [Receipt]
+    , receivables :: [Receivable]
     } deriving (Show, Eq)
 
 instance ToJSON RcptTrx where
     toJSON RcptTrx {..} = object
         [ "trxid" .= trxid
         , "receipts" .= receipts
+        , "receivables" .= receivables
         ]
         
 data Receipt = Receipt
     { journal :: Journal
     , bankstmts :: [Bankstmt]
-    , receivables :: [Receivable]
     } deriving (Show, Eq)
 
 instance ToJSON Receipt where
     toJSON Receipt {..} = object
         [ "journal" .= journal
         , "bankstmts" .= bankstmts
-        , "receivables" .= receivables
         ]
 
 data Journal = Journal
@@ -53,11 +53,11 @@ data Journal = Journal
     , paymentid :: String
     , merchantid :: String
     , pay_date :: Day
-    , checking :: Int
-    , ccfee :: Int
-    , disc :: Int
-    , ar_payment_clearing :: Int
-    , onoff_bridge :: Int
+    , checking :: Double
+    , ccfee :: Double
+    , disc :: Double
+    , ar_payment_clearing :: Double
+    , onoff_bridge :: Double
     } deriving (Show, Generic, FromRow, Eq)
 
 instance ToJSON Journal where
@@ -77,8 +77,10 @@ data Receivable = Receivable
     { customer :: String
     , acctdate :: Day
     , ccy :: String
-    , ccar :: Int
-    , cccm :: Int
+    , ccar :: Double
+    , cccm :: Double
+    , ccar_applied :: Double
+    , cccm_applied :: Double
     } deriving (Show, Generic, FromRow, Eq)
 
 instance ToJSON Receivable where
@@ -88,11 +90,13 @@ instance ToJSON Receivable where
         , "ccy" .= ccy
         , "ccar" .= ccar
         , "cccm" .= cccm
+        , "ccar_applied" .= ccar_applied
+        , "cccm_applied" .= cccm_applied
         ]
 
 data Payment = Payment
     { date :: Day
-    , payamt :: Int
+    , payamt :: Double
     } deriving (Show, Generic, FromRow, Eq)
 
 instance ToJSON Payment where
@@ -104,7 +108,7 @@ instance ToJSON Payment where
 data Bankstmt = Bankstmt
     { accountno :: String
     , trxdate :: Day
-    , dramt :: Int
+    , dramt :: Double
     } deriving (Show, Generic, FromRow, Eq)
 
 instance ToJSON Bankstmt where
@@ -158,11 +162,11 @@ allCombs r rs = filter (elem r) $ cs
     cnt = length rs
     cs = concat $ [combination n rs | n <- [1 .. cnt]]
 
-receivableInfo :: Connection -> Journal -> IO [Receivable]
-receivableInfo conn j =
+receivableInfo :: Connection -> String -> IO [Receivable]
+receivableInfo conn pid =
   query conn [sql|
         with inv as (
-	  select reference, code, salesdate, ccy
+	  select distinct code, salesdate, ccy
 	  from inv_hdr ih join erp_code ec on ih.gateway = ec.gateway and ih.settleco = ec.settleco 
 	  where reference in (
 	        select distinct reference from compare_settled cs 
@@ -172,12 +176,23 @@ receivableInfo conn j =
 	         case when e.salerfnd = 'sale' then amount else 0 end as sale,
 		 case when e.salerfnd = 'refund' then amount else 0 end as refund	   
 	  from erp_inv e join inv v on e.customer = v.code and e.acctdate = v.salesdate and e.ccy = v.ccy
+        ), issued as (
+          select customer, acctdate, ccy, sum(sale) ccar, sum(refund) cccm 
+          from base 
+          group by customer, acctdate, ccy
+        ), applied as (
+          select customer, acctdate, ccy, sum(ccar) as ccar_applied, sum(cccm) as cccm_applied 
+	  from erp_applied
+	  where customer = (select distinct customer from issued) and
+                acctdate in (select distinct acctdate from issued)
+	  group by customer, acctdate, ccy
         )
-        select customer, acctdate, ccy, sum(sale) :: int8 ccar, sum(refund) :: int8 cccm 
-        from base 
-        group by customer, acctdate, ccy
+        select i.customer, i.acctdate, i.ccy, i.ccar :: float8, i.cccm :: float8, 
+	       coalesce(a.ccar_applied, 0) :: float8 ccar_applied,
+               coalesce(a.cccm_applied, 0) :: float8 cccm_applied
+        from issued i left join applied a on i.customer = a.customer and i.acctdate = a.acctdate and i.ccy = a.ccy
+        order by i.customer, i.acctdate
      |] $ (Only pid)
-  where pid = paymentid j
 
 journalInfo :: Connection -> String -> IO [Journal]
 journalInfo conn pid =
@@ -204,9 +219,9 @@ journalInfo conn pid =
         ) 
         select row_number() over(order by p.paymentid, p.date) :: int8 sq, p.paymentid,
           p.merchantid, p.date pay_date,
-          checking :: int8, ccfee :: int8, coalesce(disc, 0) :: int8 disc,
-          coalesce(ar_payment_clearing,0) :: int8 ar_payment_clearing,
-          coalesce(onoff_bridge,0) :: int8 onoff_bridge
+          checking :: float8, ccfee :: float8, coalesce(disc, 0) :: float8 disc,
+          coalesce(ar_payment_clearing,0) :: float8 ar_payment_clearing,
+          coalesce(onoff_bridge,0) :: float8 onoff_bridge
         from payment p join fee f on p.paymentid = f.paymentid and p.date = f.date 
                left join disc   d on p.paymentid = d.paymentid and p.date = d.date
                left join clear  c on p.paymentid = c.paymentid and p.date = c.date
@@ -219,7 +234,7 @@ bankstmtInfoBSP conn j =
     query
         conn
         [sql|
-        select '630-006859-038' accountno, date trxdate, amount :: int8 dramt
+        select '630-006859-038' accountno, date trxdate, amount :: float8 dramt
         from ccsettle
         where gateway = 'BSP' and settleco = substring(?, 1, 2) and
           date >= ? and amount = ?
@@ -246,7 +261,7 @@ bankstmtInfoLJSP conn j = do
             group by paymentid, date, merchantid, account
             having sum(amount) != 0
           )
-          select date, amount :: int8
+          select date, amount :: float8
           from base
        |] $
         (dt, merchant) :: IO [Payment]
@@ -254,14 +269,14 @@ bankstmtInfoLJSP conn j = do
         query
             conn
             [sql|
-          select accountno, trxdate, dramt :: Int8
+          select accountno, trxdate, dramt :: float8
           from bankstmt
           where trxdate = ? and merchantid = ?
        |] $
         (dt, merchant) :: IO [Bankstmt]
-    let ps' = map payamt ps :: [Int]
-    let bs' = map dramt bs :: [Int]
-    let matched = extractBankStmts keyamt ps' bs' :: [Int]
+    let ps' = map payamt ps :: [Double]
+    let bs' = map dramt bs :: [Double]
+    let matched = extractBankStmts keyamt ps' bs' :: [Double]
     return $ filter (\x -> (dramt x) `elem` matched) bs
 
 relevantBankstmts :: Connection -> Journal -> IO [Bankstmt]
@@ -271,14 +286,13 @@ relevantBankstmts conn j
 
 receiptInfo :: Connection -> Journal -> IO Receipt
 receiptInfo conn j = do
-    rs <- receivableInfo conn j
     bs <- relevantBankstmts conn j
-    return Receipt {journal = j, bankstmts = bs, receivables = rs}
-
+    return Receipt {journal = j, bankstmts = bs}
 
 getReceiptTrxInfo :: String -> IO RcptTrx
 getReceiptTrxInfo pid = do
     conn <- PG.connect aprsPG
+    rcvbl <- receivableInfo conn pid
     js <- journalInfo conn pid
-    rs <- mapM (\x -> receiptInfo conn x) js
-    return RcptTrx {trxid = pid, receipts = rs}
+    ri <- mapM (\x -> receiptInfo conn x) js
+    return RcptTrx {trxid = pid, receipts = ri, receivables = rcvbl}
